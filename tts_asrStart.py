@@ -13,10 +13,10 @@ import requests
 import threading
 import hashlib
 import platform
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Generator
 from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -80,6 +80,12 @@ class Config:
         "bits_per_sample": 16,
         "channels": 1
     }
+    # 新增：缓存配置
+    CACHE_DIR = os.path.join(current_dir, "cache")  # 缓存目录
+    MAX_CACHE_SIZE = 100  # 最大缓存数量
+    CACHE_EXPIRE_HOURS = 24  # 缓存过期时间（小时）
+    # 新增：批量处理配置
+    BATCH_MAX_SIZE = 10  # 批量处理最大任务数
 
 # 实例化配置
 CFG = Config()
@@ -91,6 +97,115 @@ TTS_PIPELINE = None  # GPT_SoVITS TTS实例
 TTS_CONFIG = None  # TTS配置实例
 MACHINE_ID = ""  # 设备唯一ID
 ENCRYPTION_PASSWORD = ""  # 最终使用的加密密码
+CACHE_MANAGER = None  # 缓存管理器实例
+
+# -------------------------- 新增：缓存管理工具 --------------------------
+class CacheManager:
+    """缓存管理器，用于缓存常用TTS结果和ASR结果"""
+    
+    def __init__(self, cache_dir: str, max_size: int, expire_hours: int):
+        self.cache_dir = normalize_path(cache_dir)
+        self.max_size = max_size
+        self.expire_seconds = expire_hours * 3600
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.tts_cache_dir = os.path.join(self.cache_dir, "tts")
+        self.asr_cache_dir = os.path.join(self.cache_dir, "asr")
+        os.makedirs(self.tts_cache_dir, exist_ok=True)
+        os.makedirs(self.asr_cache_dir, exist_ok=True)
+        logger.info(f"[缓存初始化] 缓存目录: {self.cache_dir}, 最大缓存: {max_size}, 过期时间: {expire_hours}小时")
+
+    def _get_cache_key(self, content: str) -> str:
+        """生成内容的哈希作为缓存键"""
+        return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    def _is_expired(self, file_path: str) -> bool:
+        """检查缓存是否过期"""
+        if not os.path.exists(file_path):
+            return True
+        file_mtime = os.path.getmtime(file_path)
+        return time.time() - file_mtime > self.expire_seconds
+
+    def _clean_expired(self):
+        """清理过期缓存"""
+        for cache_type in [self.tts_cache_dir, self.asr_cache_dir]:
+            for filename in os.listdir(cache_type):
+                file_path = os.path.join(cache_type, filename)
+                if self._is_expired(file_path):
+                    try:
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                        elif os.path.isdir(file_path):
+                            shutil.rmtree(file_path)
+                        logger.debug(f"[缓存清理] 移除过期缓存: {filename}")
+                    except Exception as e:
+                        logger.warning(f"[缓存清理] 清理{filename}失败: {str(e)}")
+
+    def _limit_cache_size(self):
+        """限制缓存数量不超过最大值"""
+        for cache_type in [self.tts_cache_dir, self.asr_cache_dir]:
+            files = [(os.path.join(cache_type, f), os.path.getmtime(os.path.join(cache_type, f))) 
+                    for f in os.listdir(cache_type) 
+                    if os.path.isfile(os.path.join(cache_type, f))]
+            # 按修改时间排序，保留最新的max_size个
+            files.sort(key=lambda x: x[1], reverse=True)
+            if len(files) > self.max_size:
+                for file_path, _ in files[self.max_size:]:
+                    try:
+                        os.remove(file_path)
+                        logger.debug(f"[缓存限制] 移除旧缓存: {os.path.basename(file_path)}")
+                    except Exception as e:
+                        logger.warning(f"[缓存限制] 移除{os.path.basename(file_path)}失败: {str(e)}")
+
+    def get_tts_cache(self, text: str, ref_audio_path: str) -> Optional[str]:
+        """获取TTS缓存（返回音频路径）"""
+        self._clean_expired()
+        content_key = f"{text}|{ref_audio_path}"
+        cache_key = self._get_cache_key(content_key)
+        cache_path = os.path.join(self.tts_cache_dir, f"{cache_key}.wav")
+        if os.path.exists(cache_path) and not self._is_expired(cache_path):
+            logger.debug(f"[TTS缓存] 命中缓存: {cache_key}")
+            return cache_path
+        return None
+
+    def save_tts_cache(self, text: str, ref_audio_path: str, audio_path: str) -> Optional[str]:
+        """保存TTS缓存（复制音频文件到缓存目录）"""
+        try:
+            content_key = f"{text}|{ref_audio_path}"
+            cache_key = self._get_cache_key(content_key)
+            cache_path = os.path.join(self.tts_cache_dir, f"{cache_key}.wav")
+            shutil.copy2(audio_path, cache_path)
+            self._limit_cache_size()
+            logger.debug(f"[TTS缓存] 保存缓存: {cache_key}")
+            return cache_path
+        except Exception as e:
+            logger.warning(f"[TTS缓存] 保存失败: {str(e)}")
+            return None
+
+    def get_asr_cache(self, audio_path: str) -> Optional[str]:
+        """获取ASR缓存（返回LAB路径）"""
+        self._clean_expired()
+        # 使用音频文件哈希作为缓存键
+        with open(audio_path, "rb") as f:
+            audio_hash = hashlib.md5(f.read()).hexdigest()
+        cache_path = os.path.join(self.asr_cache_dir, f"{audio_hash}.lab")
+        if os.path.exists(cache_path) and not self._is_expired(cache_path):
+            logger.debug(f"[ASR缓存] 命中缓存: {audio_hash}")
+            return cache_path
+        return None
+
+    def save_asr_cache(self, audio_path: str, lab_path: str) -> Optional[str]:
+        """保存ASR缓存（复制LAB文件到缓存目录）"""
+        try:
+            with open(audio_path, "rb") as f:
+                audio_hash = hashlib.md5(f.read()).hexdigest()
+            cache_path = os.path.join(self.asr_cache_dir, f"{audio_hash}.lab")
+            shutil.copy2(lab_path, cache_path)
+            self._limit_cache_size()
+            logger.debug(f"[ASR缓存] 保存缓存: {audio_hash}")
+            return cache_path
+        except Exception as e:
+            logger.warning(f"[ASR缓存] 保存失败: {str(e)}")
+            return None
 
 # -------------------------- 基础工具函数（通用功能） --------------------------
 def normalize_path(path: str) -> str:
@@ -356,9 +471,16 @@ def audio_to_pcm(audio_path: str) -> Optional[bytes]:
         logger.error(f"[ASR预处理] 音频转换失败: {str(e)}", exc_info=True)
         return None
 
-def generate_lab_from_audio(audio_path: str) -> Optional[str]:
-    """ASR处理音频生成LAB文件（包含时间戳和拼音）"""
-    global ASR_MODEL
+def generate_lab_from_audio(audio_path: str, use_cache: bool = True) -> Optional[str]:
+    """ASR处理音频生成LAB文件（包含时间戳和拼音），新增缓存支持"""
+    global ASR_MODEL, CACHE_MANAGER
+    
+    # 尝试从缓存获取
+    if use_cache and CACHE_MANAGER:
+        cached_lab = CACHE_MANAGER.get_asr_cache(audio_path)
+        if cached_lab:
+            return cached_lab
+    
     if not ASR_MODEL:
         logger.error("[ASR处理] 模型未初始化")
         return None
@@ -443,6 +565,11 @@ def generate_lab_from_audio(audio_path: str) -> Optional[str]:
             for seg in lab_segments:
                 f.write(f"{seg['begin']} {seg['end']} {seg['pinyin']}\n")
         logger.info(f"[ASR处理] LAB文件生成成功: {os.path.basename(lab_path)}")
+        
+        # 保存到缓存
+        if use_cache and CACHE_MANAGER:
+            CACHE_MANAGER.save_asr_cache(audio_path, lab_path)
+            
         return lab_path
     except Exception as e:
         logger.error(f"[ASR处理] LAB文件保存失败: {str(e)}", exc_info=True)
@@ -489,31 +616,74 @@ def save_tts_audio(audio_io: io.BytesIO, save_dir: str, file_name: str) -> Optio
         logger.error(f"[TTS保存] 失败: {str(e)}", exc_info=True)
         return None
 
+# 新增：流式音频生成器
+def tts_stream_generator(params: Dict[str, Any]) -> Generator[bytes, None, None]:
+    """生成流式音频片段（用于实时播放）"""
+    global TTS_PIPELINE
+    if not TTS_PIPELINE:
+        raise Exception("TTS pipeline not initialized")
+    
+    try:
+        # 获取TTS生成器
+        generator = TTS_PIPELINE.run(params)
+        sample_rate, _ = next(generator)  # 获取采样率
+        
+        # 发送WAV头部（仅第一次）
+        def create_wav_header(data_length: int, sample_rate: int):
+            """创建WAV文件头部"""
+            bits_per_sample = 16
+            channels = 1
+            byte_rate = sample_rate * channels * bits_per_sample // 8
+            block_align = channels * bits_per_sample // 8
+            header = b""
+            header += b"RIFF" + struct.pack("<I", 36 + data_length) + b"WAVE"
+            header += b"fmt " + struct.pack("<I", 16) + struct.pack("<H", 1)
+            header += struct.pack("<H", channels) + struct.pack("<I", sample_rate)
+            header += struct.pack("<I", byte_rate) + struct.pack("<H", block_align)
+            header += struct.pack("<H", bits_per_sample)
+            header += b"data" + struct.pack("<I", data_length)
+            return header
+        
+        # 先发送头部（预留足够大的数据长度）
+        yield create_wav_header(1024*1024*10, sample_rate)  # 10MB预留空间
+        
+        # 发送音频数据
+        for _, audio_np in generator:
+            # 转换为16bit PCM
+            audio_np = (audio_np * 32767).astype(np.int16)
+            yield audio_np.tobytes()
+            
+    except Exception as e:
+        logger.error(f"[TTS流式生成] 错误: {str(e)}", exc_info=True)
+        raise
+
 # -------------------------- 服务初始化（整合所有流程） --------------------------
 def initialize_service() -> bool:
     """服务全局初始化（设备ID+密码验证+TTS解密+模型加载）"""
-    global MACHINE_ID, ENCRYPTION_PASSWORD, TTS_CONFIG, TTS_PIPELINE, ASR_MODEL
+    global MACHINE_ID, ENCRYPTION_PASSWORD, TTS_CONFIG, TTS_PIPELINE, ASR_MODEL, CACHE_MANAGER
     logger.info("="*60)
     logger.info("         TTS+ASR整合服务 - 初始化开始")
     logger.info("="*60)
     
     # 1. 生成设备唯一ID
     MACHINE_ID = get_machine_unique_id()
-    # 2. 获取并验证加密密码
+    # 2. 初始化缓存管理器
+    CACHE_MANAGER = CacheManager(CFG.CACHE_DIR, CFG.MAX_CACHE_SIZE, CFG.CACHE_EXPIRE_HOURS)
+    # 3. 获取并验证加密密码
     ENCRYPTION_PASSWORD = get_encryption_password(MACHINE_ID)
     if not validate_password(MACHINE_ID, ENCRYPTION_PASSWORD):
         logger.error("[初始化] 密码验证失败，服务无法启动")
         return False
-    # 3. 解密TTS资源
+    # 4. 解密TTS资源
     if not decrypt_tts_resources(ENCRYPTION_PASSWORD):
         logger.error("[初始化] TTS资源解密失败，服务无法启动")
         return False
-    # 4. 初始化TTS模型
+    # 5. 初始化TTS模型
     TTS_CONFIG, TTS_PIPELINE = init_tts_pipeline(ENCRYPTION_PASSWORD)
     if not TTS_PIPELINE:
         logger.error("[初始化] TTS模型加载失败，服务无法启动")
         return False
-    # 5. 初始化ASR模型
+    # 6. 初始化ASR模型
     ASR_MODEL = load_asr_model()
     if not ASR_MODEL:
         logger.error("[初始化] ASR模型加载失败，服务无法启动")
@@ -529,7 +699,7 @@ def initialize_service() -> bool:
 app = FastAPI(
     title="TTS+ASR整合服务",
     description="基于GPT_SoVITS的TTS合成 + faster-whisper的ASR语音转写（生成LAB文件）",
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs"  # 启用Swagger文档（访问http://ip:port/docs调试）
 )
 
@@ -546,12 +716,35 @@ class TTSASRRequest(BaseModel):
     prompt_lang: str = "zh"  # 提示语言（默认中文）
     speed_factor: float = 1.0  # 语速（1.0为正常）
     media_type: str = "wav"  # 输出音频格式（仅支持wav/raw）
+    use_cache: bool = True  # 是否使用缓存
 
 class ASRRequest(BaseModel):
     """单独ASR接口请求参数"""
     audio_path: str  # 待处理音频路径（必填，WAV格式）
     save_dir: str  # LAB保存目录（必填）
     file_name: str  # LAB文件名（无后缀，必填）
+    use_cache: bool = True  # 是否使用缓存
+
+# 新增：单独TTS接口请求模型
+class TTSRequest(BaseModel):
+    """单独TTS接口请求参数"""
+    text: str  # 待合成的文本（必填）
+    ref_audio_path: str  # 参考音频路径（必填，用于音色克隆）
+    ref_audio_text: str  # 参考音频对应的文本（必填）
+    save_dir: str  # 音频保存目录（必填）
+    file_name: str  # 文件名（无后缀，必填）
+    # 可选参数
+    text_lang: str = "zh"  # 文本语言（默认中文）
+    prompt_lang: str = "zh"  # 提示语言（默认中文）
+    speed_factor: float = 1.0  # 语速（1.0为正常）
+    media_type: str = "wav"  # 输出音频格式（仅支持wav/raw）
+    use_cache: bool = True  # 是否使用缓存
+
+# 新增：批量处理请求模型
+class BatchTTSRequest(BaseModel):
+    """批量TTS请求参数"""
+    tasks: List[TTSRequest]  # 批量任务列表
+    max_parallel: int = 2  # 最大并行数
 
 # 安全验证依赖（所有接口需通过验证）
 def verify_access() -> bool:
@@ -574,6 +767,11 @@ async def health_check(auth: bool = Depends(verify_access)):
         "machine_id": MACHINE_ID[:8] + "..." if MACHINE_ID else "unknown",
         "tts_device": TTS_CONFIG.device if TTS_CONFIG else "unknown",
         "asr_model": CFG.ASR_MODEL_PATH if ASR_MODEL else "unknown",
+        "cache_status": {
+            "enabled": True if CACHE_MANAGER else False,
+            "tts_cache_count": len(os.listdir(CACHE_MANAGER.tts_cache_dir)) if CACHE_MANAGER else 0,
+            "asr_cache_count": len(os.listdir(CACHE_MANAGER.asr_cache_dir)) if CACHE_MANAGER else 0
+        },
         "note": "调用接口时file_name无需带后缀，自动补全"
     }
 
@@ -598,36 +796,50 @@ async def tts_asr_handler(req: TTSASRRequest, auth: bool = Depends(verify_access
         return JSONResponse(status_code=400, content={"message": "media_type仅支持wav/raw"})
     
     try:
-        # 2. TTS合成音频
+        # 2. TTS合成音频（支持缓存）
         tts_start = time.time()
         logger.debug(f"[TTS+ASR请求-{request_id}] 开始TTS合成")
-        # 构造TTS请求参数
-        tts_params = {
-            "text": req.text,
-            "ref_audio_path": req.ref_audio_path,
-            "ref_audio_text": req.ref_audio_text,
-            "text_lang": req.text_lang,
-            "prompt_lang": req.prompt_lang,
-            "speed_factor": req.speed_factor
-        }
-        # 调用TTS生成音频（GPT_SoVITS返回生成器）
-        tts_generator = TTS_PIPELINE.run(tts_params)
-        sample_rate, audio_np = next(tts_generator)  # 获取音频数据
-        # 打包音频
-        audio_io = pack_audio(audio_np, sample_rate, req.media_type)
-        if not audio_io:
-            return JSONResponse(status_code=500, content={"message": "TTS音频打包失败"})
-        # 保存音频
-        audio_path = save_tts_audio(audio_io, req.save_dir, req.file_name)
-        if not audio_path:
-            return JSONResponse(status_code=500, content={"message": "TTS音频保存失败"})
+        
+        # 尝试从缓存获取
+        cached_audio = None
+        if req.use_cache and CACHE_MANAGER:
+            cached_audio = CACHE_MANAGER.get_tts_cache(req.text, req.ref_audio_path)
+        
+        if cached_audio and os.path.exists(cached_audio):
+            logger.info(f"[TTS+ASR请求-{request_id}] 使用TTS缓存")
+            audio_path = save_tts_audio(io.BytesIO(open(cached_audio, "rb").read()), req.save_dir, req.file_name)
+        else:
+            # 构造TTS请求参数
+            tts_params = {
+                "text": req.text,
+                "ref_audio_path": req.ref_audio_path,
+                "ref_audio_text": req.ref_audio_text,
+                "text_lang": req.text_lang,
+                "prompt_lang": req.prompt_lang,
+                "speed_factor": req.speed_factor
+            }
+            # 调用TTS生成音频（GPT_SoVITS返回生成器）
+            tts_generator = TTS_PIPELINE.run(tts_params)
+            sample_rate, audio_np = next(tts_generator)  # 获取音频数据
+            # 打包音频
+            audio_io = pack_audio(audio_np, sample_rate, req.media_type)
+            if not audio_io:
+                return JSONResponse(status_code=500, content={"message": "TTS音频打包失败"})
+            # 保存音频
+            audio_path = save_tts_audio(audio_io, req.save_dir, req.file_name)
+            if not audio_path:
+                return JSONResponse(status_code=500, content={"message": "TTS音频保存失败"})
+            # 保存到缓存
+            if req.use_cache and CACHE_MANAGER:
+                CACHE_MANAGER.save_tts_cache(req.text, req.ref_audio_path, audio_path)
+        
         tts_duration = time.time() - tts_start
         logger.info(f"[TTS+ASR请求-{request_id}] TTS完成，耗时: {tts_duration:.2f}秒")
         
         # 3. ASR生成LAB文件
         asr_start = time.time()
         logger.debug(f"[TTS+ASR请求-{request_id}] 开始ASR处理")
-        lab_path = generate_lab_from_audio(audio_path)
+        lab_path = generate_lab_from_audio(audio_path, req.use_cache)
         if not lab_path:
             return JSONResponse(status_code=500, content={"message": "ASR生成LAB文件失败"})
         asr_duration = time.time() - asr_start
@@ -644,7 +856,8 @@ async def tts_asr_handler(req: TTSASRRequest, auth: bool = Depends(verify_access
             "lab_path": lab_path,
             "text": req.text,
             "tts_duration": f"{tts_duration:.2f}秒",
-            "asr_duration": f"{asr_duration:.2f}秒"
+            "asr_duration": f"{asr_duration:.2f}秒",
+            "cache_used": cached_audio is not None
         }
     except Exception as e:
         error_msg = str(e)
@@ -659,6 +872,7 @@ async def asr_handler(
     audio_file: UploadFile = File(..., description="待处理音频文件（WAV格式）"),
     save_dir: str = Form(..., description="LAB保存目录"),
     file_name: str = Form(..., description="LAB文件名（无后缀）"),
+    use_cache: bool = Form(True, description="是否使用缓存"),
     auth: bool = Depends(verify_access)
 ):
     """仅处理上传的音频文件，生成对应的LAB文件（用于humanStart预处理）"""
@@ -682,9 +896,9 @@ async def asr_handler(
             f.write(await audio_file.read())
         logger.debug(f"[ASR单独请求-{request_id}] 临时音频保存: {temp_audio_path}")
         
-        # 3. ASR处理生成LAB
+        # 3. ASR处理生成LAB（支持缓存）
         start_time = time.time()
-        generated_lab_path = generate_lab_from_audio(temp_audio_path)
+        generated_lab_path = generate_lab_from_audio(temp_audio_path, use_cache)
         if not generated_lab_path:
             return JSONResponse(status_code=500, content={"message": "ASR处理失败，未生成LAB文件"})
         
@@ -716,6 +930,249 @@ async def asr_handler(
         return JSONResponse(
             status_code=500,
             content={"success": False, "request_id": request_id, "message": f"处理失败: {error_msg}"}
+        )
+
+# 新增：单独TTS接口
+@app.post("/tts", summary="单独TTS接口")
+async def tts_handler(req: TTSRequest, auth: bool = Depends(verify_access)):
+    """仅进行文本到语音的合成，不进行ASR处理"""
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[TTS单独请求-{request_id}] 收到请求: 文件名={req.file_name}")
+    
+    # 参数校验
+    if not req.text.strip():
+        return JSONResponse(status_code=400, content={"message": "text（合成文本）不能为空"})
+    if not os.path.exists(req.ref_audio_path):
+        return JSONResponse(status_code=400, content={"message": f"参考音频不存在: {req.ref_audio_path}"})
+    if not req.ref_audio_text.strip():
+        return JSONResponse(status_code=400, content={"message": "ref_audio_text（参考文本）不能为空"})
+    if not req.save_dir:
+        return JSONResponse(status_code=400, content={"message": "save_dir（保存目录）不能为空"})
+    if not req.file_name.strip():
+        return JSONResponse(status_code=400, content={"message": "file_name（文件名）不能为空"})
+    if req.media_type not in ["wav", "raw"]:
+        return JSONResponse(status_code=400, content={"message": "media_type仅支持wav/raw"})
+    
+    try:
+        # 尝试从缓存获取
+        cached_audio = None
+        if req.use_cache and CACHE_MANAGER:
+            cached_audio = CACHE_MANAGER.get_tts_cache(req.text, req.ref_audio_path)
+        
+        if cached_audio and os.path.exists(cached_audio):
+            logger.info(f"[TTS单独请求-{request_id}] 使用缓存")
+            audio_path = save_tts_audio(io.BytesIO(open(cached_audio, "rb").read()), req.save_dir, req.file_name)
+        else:
+            # TTS合成
+            start_time = time.time()
+            tts_params = {
+                "text": req.text,
+                "ref_audio_path": req.ref_audio_path,
+                "ref_audio_text": req.ref_audio_text,
+                "text_lang": req.text_lang,
+                "prompt_lang": req.prompt_lang,
+                "speed_factor": req.speed_factor
+            }
+            tts_generator = TTS_PIPELINE.run(tts_params)
+            sample_rate, audio_np = next(tts_generator)
+            audio_io = pack_audio(audio_np, sample_rate, req.media_type)
+            if not audio_io:
+                return JSONResponse(status_code=500, content={"message": "TTS音频打包失败"})
+            audio_path = save_tts_audio(audio_io, req.save_dir, req.file_name)
+            if not audio_path:
+                return JSONResponse(status_code=500, content={"message": "TTS音频保存失败"})
+            # 保存到缓存
+            if req.use_cache and CACHE_MANAGER:
+                CACHE_MANAGER.save_tts_cache(req.text, req.ref_audio_path, audio_path)
+            duration = time.time() - start_time
+            logger.info(f"[TTS单独请求-{request_id}] 合成完成，耗时: {duration:.2f}秒")
+        
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "audio_path": audio_path,
+            "text": req.text,
+            "duration": f"{duration:.2f}秒" if not cached_audio else "0.00秒（缓存）",
+            "cache_used": cached_audio is not None
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"[TTS单独请求-{request_id}] 处理失败: {error_msg}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "request_id": request_id, "message": f"处理失败: {error_msg}"}
+        )
+
+# 新增：TTS流式接口（实时返回音频流）
+@app.post("/tts/stream", summary="TTS流式接口")
+async def tts_stream_handler(
+    text: str = Form(..., description="待合成文本"),
+    ref_audio_path: str = Form(..., description="参考音频路径"),
+    ref_audio_text: str = Form(..., description="参考音频文本"),
+    text_lang: str = Form("zh", description="文本语言"),
+    prompt_lang: str = Form("zh", description="提示语言"),
+    speed_factor: float = Form(1.0, description="语速"),
+    auth: bool = Depends(verify_access)
+):
+    """实时流式返回TTS音频，适用于实时播放场景"""
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[TTS流式请求-{request_id}] 收到请求")
+    
+    # 参数校验
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text（合成文本）不能为空")
+    if not os.path.exists(ref_audio_path):
+        raise HTTPException(status_code=400, detail=f"参考音频不存在: {ref_audio_path}")
+    if not ref_audio_text.strip():
+        raise HTTPException(status_code=400, detail="ref_audio_text（参考文本）不能为空")
+    
+    # 构造参数
+    tts_params = {
+        "text": text,
+        "ref_audio_path": ref_audio_path,
+        "ref_audio_text": ref_audio_text,
+        "text_lang": text_lang,
+        "prompt_lang": prompt_lang,
+        "speed_factor": speed_factor
+    }
+    
+    # 返回流式响应
+    return StreamingResponse(
+        tts_stream_generator(tts_params),
+        media_type="audio/wav",
+        headers={"X-Request-ID": request_id}
+    )
+
+# 新增：批量TTS处理接口
+@app.post("/tts/batch", summary="批量TTS处理接口")
+async def batch_tts_handler(req: BatchTTSRequest, auth: bool = Depends(verify_access)):
+    """批量处理多个TTS任务，支持并行处理"""
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[批量TTS请求-{request_id}] 收到请求，任务数量: {len(req.tasks)}")
+    
+    # 参数校验
+    if not req.tasks:
+        return JSONResponse(status_code=400, content={"message": "任务列表不能为空"})
+    if len(req.tasks) > CFG.BATCH_MAX_SIZE:
+        return JSONResponse(
+            status_code=400, 
+            content={"message": f"批量任务最大支持{CFG.BATCH_MAX_SIZE}个，当前{len(req.tasks)}个"}
+        )
+    if req.max_parallel < 1 or req.max_parallel > 5:
+        return JSONResponse(
+            status_code=400, 
+            content={"message": "max_parallel必须在1-5之间"}
+        )
+    
+    # 处理单个任务的函数
+    def process_single_task(task: TTSRequest, task_idx: int) -> Dict[str, Any]:
+        try:
+            # 检查参数
+            if not task.text.strip() or not os.path.exists(task.ref_audio_path):
+                return {
+                    "task_index": task_idx,
+                    "status": "error",
+                    "message": "无效的任务参数"
+                }
+            
+            # 尝试缓存
+            cached_audio = None
+            if task.use_cache and CACHE_MANAGER:
+                cached_audio = CACHE_MANAGER.get_tts_cache(task.text, task.ref_audio_path)
+            
+            if cached_audio and os.path.exists(cached_audio):
+                audio_path = save_tts_audio(
+                    io.BytesIO(open(cached_audio, "rb").read()), 
+                    task.save_dir, 
+                    task.file_name
+                )
+                return {
+                    "task_index": task_idx,
+                    "status": "success",
+                    "audio_path": audio_path,
+                    "text": task.text[:50] + "...",
+                    "cache_used": True
+                }
+            
+            # TTS合成
+            start_time = time.time()
+            tts_params = {
+                "text": task.text,
+                "ref_audio_path": task.ref_audio_path,
+                "ref_audio_text": task.ref_audio_text,
+                "text_lang": task.text_lang,
+                "prompt_lang": task.prompt_lang,
+                "speed_factor": task.speed_factor
+            }
+            tts_generator = TTS_PIPELINE.run(tts_params)
+            sample_rate, audio_np = next(tts_generator)
+            audio_io = pack_audio(audio_np, sample_rate, task.media_type)
+            if not audio_io:
+                return {
+                    "task_index": task_idx,
+                    "status": "error",
+                    "message": "音频打包失败"
+                }
+            audio_path = save_tts_audio(audio_io, task.save_dir, task.file_name)
+            if not audio_path:
+                return {
+                    "task_index": task_idx,
+                    "status": "error",
+                    "message": "音频保存失败"
+                }
+            # 保存缓存
+            if task.use_cache and CACHE_MANAGER:
+                CACHE_MANAGER.save_tts_cache(task.text, task.ref_audio_path, audio_path)
+            
+            duration = time.time() - start_time
+            return {
+                "task_index": task_idx,
+                "status": "success",
+                "audio_path": audio_path,
+                "text": task.text[:50] + "...",
+                "duration": f"{duration:.2f}秒",
+                "cache_used": False
+            }
+        except Exception as e:
+            return {
+                "task_index": task_idx,
+                "status": "error",
+                "message": str(e)
+            }
+    
+    try:
+        # 并行处理任务
+        from concurrent.futures import ThreadPoolExecutor
+        start_time = time.time()
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=req.max_parallel) as executor:
+            # 提交所有任务
+            futures = [
+                executor.submit(process_single_task, task, idx)
+                for idx, task in enumerate(req.tasks)
+            ]
+            # 获取结果
+            for future in futures:
+                results.append(future.result())
+        
+        total_duration = time.time() - start_time
+        logger.info(f"[批量TTS请求-{request_id}] 处理完成，总耗时: {total_duration:.2f}秒")
+        
+        return {
+            "status": "completed",
+            "request_id": request_id,
+            "total_tasks": len(req.tasks),
+            "success_count": sum(1 for r in results if r["status"] == "success"),
+            "total_duration": f"{total_duration:.2f}秒",
+            "results": results
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"[批量TTS请求-{request_id}] 处理失败: {error_msg}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "request_id": request_id, "message": f"处理失败: {error_msg}"}
         )
 
 # -------------------------- 全局异常处理（统一错误响应） --------------------------
@@ -763,6 +1220,13 @@ def cleanup_on_exit():
             logger.info(f"[退出清理] 清理TTS临时目录: {CFG.TEMP_DECRYPT_DIR}")
         except Exception as e:
             logger.error(f"[退出清理] 清理TTS目录失败: {str(e)}", exc_info=True)
+    # 清理缓存目录（可选，根据需求决定是否保留）
+    # if os.path.exists(CFG.CACHE_DIR):
+    #     try:
+    #         shutil.rmtree(CFG.CACHE_DIR, ignore_errors=True)
+    #         logger.info(f"[退出清理] 清理缓存目录: {CFG.CACHE_DIR}")
+    #     except Exception as e:
+    #         logger.error(f"[退出清理] 清理缓存目录失败: {str(e)}", exc_info=True)
     # 其他资源清理（如模型释放，Python会自动回收）
     logger.info("[退出清理] 清理完成")
 
