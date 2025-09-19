@@ -1,0 +1,16 @@
+accum_grad: 16
+cmvn_file: global_cmvn
+#dataset_conf:
+# 基础配置
+data_conf:
+  sample_rate: 16000
+  fbank_conf:
+    num_mel_bins: 80
+
+# TTSASR专用配置（必须与模型训练时一致）
+ttsasr_conf:
+  input_channels: 16        # 音频特征通道数（与inference.py的--input_channels匹配）
+  output_channels: 3        # 输出视频通道数（RGB）
+  frame_height: 256         # 输出视频帧高度
+  frame_width: 256          # 输出视频帧宽度
+  fps: 25                   # 视频帧率
